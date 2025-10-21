@@ -1,0 +1,31 @@
+# LiveKit Core
+livekit-agents
+livekit-plugins-openai
+livekit-plugins-silero
+livekit-plugins-google
+livekit-plugins-noise-cancellation
+
+# AI & Search
+mem0ai
+ddgs
+requests
+
+# Configuration
+python-dotenv
+
+# Desktop Automation (from Nevira)
+pyautogui
+psutil
+
+# Audio Devices
+sounddevice
+
+# Wake Word Detection
+pvporcupine
+pyaudio
+
+# Keyboard Hotkey Support
+pynput
+
+# Windows Service Support
+pywin32

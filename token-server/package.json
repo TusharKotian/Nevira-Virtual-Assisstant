@@ -1,0 +1,19 @@
+{
+  "name": "nevira-token-server",
+  "version": "1.0.0",
+  "description": "Token server for Nevira LiveKit integration",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "keywords": ["livekit", "token", "nevira"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "livekit-server-sdk": "^2.0.5"
+  }
+}
