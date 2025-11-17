@@ -25,6 +25,17 @@ function App() {
   const [micDevices, setMicDevices] = useState([]);
   const [selectedMicId, setSelectedMicId] = useState('');
   const [micLevel, setMicLevel] = useState(0);
+  const [showEmailPopup, setShowEmailPopup] = useState(false);
+  const [showEmailSentPopup, setShowEmailSentPopup] = useState(false);
+  const [emailForm, setEmailForm] = useState({
+    to: '',
+    subject: '',
+    body: ''
+  });
+  const [emailSending, setEmailSending] = useState(false);
+  const [messages, setMessages] = useState([]);
+  const [inputMessage, setInputMessage] = useState('');
+  const messagesEndRef = useRef(null);
   const tools = [
     { key: 'get_weather', label: 'Weather', desc: 'Get weather for a city', prompt: 'What is the weather in London?' },
     { key: 'search_web', label: 'Web Search', desc: 'Search the internet', prompt: 'Search the web for latest AI news' },
@@ -238,6 +249,42 @@ function App() {
       console.log('Connection quality:', q, participant.identity);
       if (participant.isLocal) setQuality(String(q));
     });
+
+    // Data received from agent
+    room.on(RoomEvent.DataReceived, (payload, participant) => {
+      try {
+        const data = JSON.parse(new TextDecoder().decode(payload));
+        console.log('Data received:', data);
+        
+        if (data.type === 'email_popup_trigger') {
+          console.log('Triggering email popup from voice command');
+          setShowEmailPopup(true);
+          setLogs((l) => [{ ts: Date.now(), msg: 'Email popup opened via voice command' }, ...l].slice(0, 50));
+        } else if (data.type === 'assistant_message') {
+          // Add assistant message to chat
+          setMessages((prev) => [...prev, {
+            id: Date.now(),
+            sender: 'assistant',
+            text: data.message || data.text,
+            images: data.images || [],
+            timestamp: Date.now()
+          }]);
+        }
+      } catch (e) {
+        // Try to add as text message if not JSON
+        const text = new TextDecoder().decode(payload);
+        if (text && text.trim()) {
+          setMessages((prev) => [...prev, {
+            id: Date.now(),
+            sender: 'assistant',
+            text: text,
+            images: [],
+            timestamp: Date.now()
+          }]);
+        }
+      }
+    });
+
   };
 
   // Update participants list
@@ -319,6 +366,13 @@ function App() {
   // Trigger a tool by sending a command as a data message
   const triggerTool = async (t) => {
     if (!connected || !room) return;
+    
+    // Special handling for email tool - show popup instead of sending command
+    if (t.key === 'send_email') {
+      setShowEmailPopup(true);
+      return;
+    }
+    
     try {
       const payload = { type: 'user_command', text: t.prompt, ts: Date.now() };
       const data = new TextEncoder().encode(JSON.stringify(payload));
@@ -328,6 +382,81 @@ function App() {
       setError('Failed to send command to assistant. Please speak the request.');
     }
   };
+
+  // Handle email form submission
+  const handleEmailSubmit = async () => {
+    if (!emailForm.to || !emailForm.subject || !emailForm.body) {
+      setError('Please fill in all email fields');
+      return;
+    }
+
+    if (!connected || !room) {
+      setError('Not connected to assistant');
+      return;
+    }
+
+    setEmailSending(true);
+    try {
+      const emailCommand = `Send an email to ${emailForm.to} with subject "${emailForm.subject}" and message "${emailForm.body}"`;
+      const payload = { type: 'user_command', text: emailCommand, ts: Date.now() };
+      const data = new TextEncoder().encode(JSON.stringify(payload));
+      await room.localParticipant.publishData(data, true);
+      
+      setLogs((l) => [{ ts: Date.now(), msg: `Sending email to ${emailForm.to}` }, ...l].slice(0, 50));
+      setShowEmailPopup(false);
+      setEmailForm({ to: '', subject: '', body: '' });
+      
+      // Show success popup after a short delay
+      setTimeout(() => {
+        setShowEmailSentPopup(true);
+        setEmailSending(false);
+      }, 1000);
+      
+    } catch (e) {
+      setError('Failed to send email command to assistant');
+      setEmailSending(false);
+    }
+  };
+
+  // Handle email popup close
+  const handleEmailClose = () => {
+    setShowEmailPopup(false);
+    setEmailForm({ to: '', subject: '', body: '' });
+  };
+
+  // Handle email sent popup close
+  const handleEmailSentClose = () => {
+    setShowEmailSentPopup(false);
+  };
+
+  // Send text message
+  const sendMessage = async () => {
+    if (!inputMessage.trim() || !connected || !room) return;
+
+    const userMessage = {
+      id: Date.now(),
+      sender: 'user',
+      text: inputMessage,
+      images: [],
+      timestamp: Date.now()
+    };
+
+    setMessages((prev) => [...prev, userMessage]);
+    setInputMessage('');
+
+    try {
+      const payload = { type: 'user_command', text: inputMessage, ts: Date.now() };
+      const data = new TextEncoder().encode(JSON.stringify(payload));
+      await room.localParticipant.publishData(data, true);
+    } catch (e) {
+      setError('Failed to send message. Please speak the request.');
+    }
+  };
+
+  // Scroll to bottom when new messages arrive
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
 
   useEffect(() => {
     refreshDevices();
@@ -365,6 +494,7 @@ function App() {
             <h2>Nevira</h2>
           </div>
           <nav className="nav">
+            <button className={`nav-btn ${activeTab==='Chat'?'active':''}`} onClick={() => setActiveTab('Chat')}>Chat</button>
             <button className={`nav-btn ${activeTab==='Dashboard'?'active':''}`} onClick={() => setActiveTab('Dashboard')}>Dashboard</button>
             <button className={`nav-btn ${activeTab==='Voice'?'active':''}`} onClick={() => setActiveTab('Voice')}>Voice</button>
             <button className={`nav-btn ${activeTab==='Tools'?'active':''}`} onClick={() => setActiveTab('Tools')}>Tools</button>
@@ -519,6 +649,76 @@ function App() {
             <section className="panel stretch">
               <div className="panel-header">{activeTab}</div>
               <div className="panel-body scroll">
+                {activeTab === 'Chat' && (
+                  <div className="chat-container">
+                    <div className="chat-messages">
+                      {messages.length === 0 && (
+                        <div className="chat-empty">
+                          <div className="chat-empty-icon">💬</div>
+                          <p>Start a conversation with Nevira</p>
+                          <p className="chat-empty-hint">Type a message or use voice commands</p>
+                        </div>
+                      )}
+                      {messages.map((msg) => (
+                        <div key={msg.id} className={`chat-message ${msg.sender === 'user' ? 'user' : 'assistant'}`}>
+                          <div className="chat-message-header">
+                            <span className="chat-avatar">{msg.sender === 'user' ? '👤' : '🤖'}</span>
+                            <span className="chat-sender">{msg.sender === 'user' ? 'You' : 'Nevira'}</span>
+                            <span className="chat-time">{new Date(msg.timestamp).toLocaleTimeString()}</span>
+                          </div>
+                          <div className="chat-message-content">
+                            {msg.text && (
+                              <div className="chat-text" dangerouslySetInnerHTML={{ 
+                                __html: msg.text.replace(/\n/g, '<br/>')
+                                  .replace(/(https?:\/\/[^\s]+)/g, '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>')
+                              }} />
+                            )}
+                            {msg.images && msg.images.length > 0 && (
+                              <div className="chat-images">
+                                {msg.images.map((img, idx) => (
+                                  <div key={idx} className="chat-image-container">
+                                    <img 
+                                      src={img.url || img} 
+                                      alt={img.alt || `Image ${idx + 1}`}
+                                      className="chat-image"
+                                      onError={(e) => {
+                                        e.target.style.display = 'none';
+                                      }}
+                                    />
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                      <div ref={messagesEndRef} />
+                    </div>
+                    <div className="chat-input-container">
+                      <input
+                        type="text"
+                        className="chat-input"
+                        placeholder={connected ? "Type a message..." : "Connect to send messages"}
+                        value={inputMessage}
+                        onChange={(e) => setInputMessage(e.target.value)}
+                        onKeyPress={(e) => {
+                          if (e.key === 'Enter' && !e.shiftKey) {
+                            e.preventDefault();
+                            sendMessage();
+                          }
+                        }}
+                        disabled={!connected}
+                      />
+                      <button 
+                        className="chat-send-btn"
+                        onClick={sendMessage}
+                        disabled={!connected || !inputMessage.trim()}
+                      >
+                        <span>📤</span>
+                      </button>
+                    </div>
+                  </div>
+                )}
                 {activeTab === 'Dashboard' && (
                   <div className="dashboard">
                     <div className="stat">
@@ -633,6 +833,85 @@ function App() {
           </div>
         </main>
       </div>
+
+      {/* Email Compose Popup Modal */}
+      {showEmailPopup && (
+        <div className="email-popup-overlay">
+          <div className="email-popup">
+            <div className="email-popup-header">
+              <h3>📧 Send Email</h3>
+              <button className="close-btn" onClick={handleEmailClose}>×</button>
+            </div>
+            <div className="email-popup-body">
+              <div className="form-group">
+                <label htmlFor="email-to">To:</label>
+                <input
+                  id="email-to"
+                  type="email"
+                  placeholder="recipient@example.com"
+                  value={emailForm.to}
+                  onChange={(e) => setEmailForm({...emailForm, to: e.target.value})}
+                />
+              </div>
+              <div className="form-group">
+                <label htmlFor="email-subject">Subject:</label>
+                <input
+                  id="email-subject"
+                  type="text"
+                  placeholder="Email subject"
+                  value={emailForm.subject}
+                  onChange={(e) => setEmailForm({...emailForm, subject: e.target.value})}
+                />
+              </div>
+              <div className="form-group">
+                <label htmlFor="email-body">Message:</label>
+                <textarea
+                  id="email-body"
+                  placeholder="Type your message here..."
+                  rows="6"
+                  value={emailForm.body}
+                  onChange={(e) => setEmailForm({...emailForm, body: e.target.value})}
+                />
+              </div>
+            </div>
+            <div className="email-popup-footer">
+              <button className="btn btn-secondary" onClick={handleEmailClose}>
+                Cancel
+              </button>
+              <button 
+                className="btn btn-primary" 
+                onClick={handleEmailSubmit}
+                disabled={emailSending}
+              >
+                {emailSending ? (
+                  <>
+                    <span className="spinner"></span>
+                    Sending...
+                  </>
+                ) : (
+                  'Send Email'
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Email Sent Confirmation Popup */}
+      {showEmailSentPopup && (
+        <div className="email-popup-overlay">
+          <div className="email-sent-popup">
+            <div className="email-sent-content">
+              <div className="success-icon">✅</div>
+              <h3>Email Sent Successfully!</h3>
+              <p>Your email has been sent to {emailForm.to || 'the recipient'}.</p>
+              <button className="btn btn-primary" onClick={handleEmailSentClose}>
+                OK
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

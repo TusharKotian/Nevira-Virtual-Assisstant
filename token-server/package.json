@@ -7,13 +7,17 @@
     "start": "node server.js",
     "dev": "node server.js"
   },
-  "keywords": ["livekit", "token", "nevira"],
+  "keywords": [
+    "livekit",
+    "token",
+    "nevira"
+  ],
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "express": "^4.18.2",
     "cors": "^2.8.5",
-    "dotenv": "^16.3.1",
+    "dotenv": "^16.6.1",
+    "express": "^4.18.2",
     "livekit-server-sdk": "^2.0.5"
   }
 }

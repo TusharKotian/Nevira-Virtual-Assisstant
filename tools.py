@@ -18,71 +18,186 @@ from livekit.agents import function_tool, RunContext
 
 from movie_ticket_agent import book_ticket
 from latest_news_agent import get_latest_news
+from automation_agent import (
+    add_task as add_task_func,
+    list_tasks as list_tasks_func,
+    complete_task as complete_task_func,
+    delete_task as delete_task_func,
+    organize_downloads_folder,
+    find_duplicate_files,
+    clean_temp_files,
+    get_clipboard as get_clipboard_func,
+    set_clipboard as set_clipboard_func,
+    generate_secure_password,
+    word_count,
+    check_internet_connection,
+    get_network_stats,
+    list_running_processes,
+    kill_process_by_name,
+    get_disk_usage
+)
+
+async def _send_to_ui(context: RunContext, text: str, images: list = None):
+    """Helper function to send messages to UI chat."""
+    try:
+        import json
+        payload = {
+            "type": "assistant_message",
+            "message": text,
+            "text": text,
+            "images": images or [],
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+        if context and context.room:
+            await context.room.local_participant.publish_data(
+                json.dumps(payload).encode('utf-8'),
+                reliable=True
+            )
+    except Exception as e:
+        logging.warning(f"Could not send message to UI: {e}")
 
 @function_tool()
-async def get_latest_news_tool(category: str = "business", count: int = 5) -> str:
+async def get_latest_news_tool(context: RunContext, category: str = "business", count: int = 5) -> str:
+    """Get latest news with improved error handling."""
     try:
-        news_text = get_latest_news(category=category, count=count)
+        news_text = await asyncio.to_thread(get_latest_news, category, count)
         if not news_text:
-            return f"No news found in {category} category."
-        return news_text
+            result = f"I couldn't find any news in the {category} category, Boss. Please try again or try a different category."
+        else:
+            result = news_text
+        # Send to UI
+        await _send_to_ui(context, result)
+        return result
     except Exception as e:
-        return f"Failed to fetch news: {str(e)}"
+        logging.error(f"Error in get_latest_news_tool: {e}")
+        result = f"I apologize, Boss. I encountered an issue fetching {category} news: {str(e)}. Please try again in a moment."
+        await _send_to_ui(context, result)
+        return result
 
 @function_tool()
 async def book_movie_ticket_tool(movie_name: str, location: str, date: str, num_tickets: int = 1) -> str:
+    """Book movie tickets with improved error handling."""
     try:
-        result = await book_ticket(event_type="movie", location=location, date=date, num_tickets=num_tickets)
-        return f"Movie booking status: {result}"
+        result = await asyncio.to_thread(book_ticket, "movie", location, date, num_tickets)
+        # The book_ticket function already returns user-friendly messages
+        return result
     except Exception as e:
-        return f"Failed to book movie tickets: {str(e)}"
+        logging.error(f"Error in book_movie_ticket_tool: {e}")
+        return f"I apologize, Boss. An unexpected error occurred while booking movie tickets: {str(e)}. Please try again or visit BookMyShow directly."
 
 @function_tool()
 async def get_weather(context: RunContext, city: str) -> str:
-    try:
-        response = requests.get(f"https://wttr.in/{city}?format=3")
-        if response.status_code == 200:
-            logging.info(f"Weather for {city}: {response.text.strip()}")
-            return response.text.strip()
-        else:
-            logging.error(f"Failed to get weather for {city}: {response.status_code}")
-            return f"Could not retrieve weather for {city}."
-    except Exception as e:
-        logging.error(f"Error retrieving weather for {city}: {e}")
-        return f"An error occurred while retrieving weather for {city}."
+    """Get weather information for a city with improved error handling."""
+    import urllib.parse
+    
+    # Clean and encode city name
+    city_clean = city.strip()
+    city_encoded = urllib.parse.quote(city_clean)
+    
+    # Try multiple formats for better results
+    formats = [
+        f"https://wttr.in/{city_encoded}?format=3",
+        f"https://wttr.in/{city_encoded}?format=1",
+    ]
+    
+    for url in formats:
+        try:
+            response = requests.get(url, timeout=10, headers={
+                'User-Agent': 'Mozilla/5.0 (compatible; Nevira Assistant)'
+            })
+            
+            if response.status_code == 200:
+                weather_text = response.text.strip()
+                if weather_text and weather_text != "Unknown location":
+                    logging.info(f"Weather for {city_clean}: {weather_text}")
+                    return f"Weather in {city_clean}: {weather_text}"
+            
+        except requests.exceptions.Timeout:
+            logging.warning(f"Weather API timeout for {city_clean}")
+            continue
+        except requests.exceptions.RequestException as e:
+            logging.warning(f"Weather API request error for {city_clean}: {e}")
+            continue
+        except Exception as e:
+            logging.error(f"Unexpected error getting weather for {city_clean}: {e}")
+            continue
+    
+    # Fallback message
+    return f"I apologize, Boss. I couldn't retrieve the weather for {city_clean} at this moment. Please try again in a moment, or check the city name is correct."
 
 @function_tool()
 async def search_web(context: RunContext, query: str) -> str:
-    try:
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=5))
-            if not results:
-                return f"No search results found for '{query}'."
-            formatted_results = []
-            for i, result in enumerate(results, 1):
-                title = result.get('title', 'No title')
-                body = result.get('body', 'No description')
-                url = result.get('href', '')
-                formatted_results.append(f"{i}. {title}\n   {body}\n   {url}")
-            output = "\n\n".join(formatted_results)
-            logging.info(f"Search results for '{query}': Found {len(results)} results")
-            return output
-    except Exception as e:
-        logging.error(f"Error searching the web for '{query}': {e}")
-        return f"An error occurred while searching the web for '{query}'."
+    """Search the web with improved error handling and retries."""
+    if not query or not query.strip():
+        return "Boss, I need a search query to help you. What would you like me to search for?"
+    
+    query_clean = query.strip()
+    max_retries = 2
+    
+    for attempt in range(max_retries):
+        try:
+            with DDGS(timeout=10) as ddgs:
+                results = list(ddgs.text(query_clean, max_results=5))
+                
+                if not results:
+                    # Try with a simpler query on retry
+                    if attempt < max_retries - 1:
+                        continue
+                    return f"I couldn't find any results for '{query_clean}', Boss. Perhaps try rephrasing your search or checking the spelling."
+                
+                formatted_results = []
+                for i, result in enumerate(results, 1):
+                    title = result.get('title', 'No title') or 'No title'
+                    body = result.get('body', 'No description') or 'No description available'
+                    url = result.get('href', '') or result.get('url', '')
+                    
+                    # Truncate long descriptions
+                    if len(body) > 200:
+                        body = body[:200] + "..."
+                    
+                    formatted_results.append(
+                        f"{i}. {title}\n   {body}\n   {url if url else 'URL not available'}"
+                    )
+                
+                output = f"I found {len(results)} result(s) for '{query_clean}':\n\n" + "\n\n".join(formatted_results)
+                logging.info(f"Search results for '{query_clean}': Found {len(results)} results")
+                return output
+                
+        except Exception as e:
+            logging.error(f"Error searching the web for '{query_clean}' (attempt {attempt + 1}): {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(1)  # Wait before retry
+                continue
+            return f"I apologize, Boss. I encountered an issue searching for '{query_clean}'. Please try again in a moment."
 
 def _looks_like_email(value: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", value or ""))
 
 
 def _load_contacts() -> dict:
+    """
+    Load contacts from environment variable or return default contacts.
+    Default contacts are hardcoded for quick access.
+    """
+    # Default contacts
+    default_contacts = {
+        "tushar": "22j61.tushar@sjec.ac.in",
+        "kevin": "22j25.kevin@sjec.ac.in",
+        "aden": "22j01.aden@sjec.ac.in"
+    }
+    
+    # Load from environment variable if available (will override defaults)
     try:
         contacts_env = os.getenv("CONTACTS_JSON", "")
         if contacts_env:
-            return json.loads(contacts_env)
+            env_contacts = json.loads(contacts_env)
+            # Merge with defaults (env takes precedence)
+            default_contacts.update(env_contacts)
+            return default_contacts
     except Exception:
         pass
-    return {}
+    
+    return default_contacts
 
 
 def _resolve_email(recipient: str) -> Optional[str]:
@@ -114,16 +229,44 @@ def _resolve_email(recipient: str) -> Optional[str]:
     return None
 
 
+@function_tool()
+async def open_email_composer(context: RunContext) -> str:
+    """
+    Opens the email composer popup interface for the user to fill in email details.
+    This is triggered when user says 'send email' without specific details.
+    """
+    try:
+        # Send data message to trigger popup in UI
+        import json
+        data = {
+            "type": "email_popup_trigger",
+            "message": "Opening email composer for you, Boss.",
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+        
+        # Send data message to trigger popup
+        await context.room.local_participant.publish_data(
+            json.dumps(data).encode('utf-8'), 
+            reliable=True
+        )
+        
+        logging.info("Sent email popup trigger data message")
+    except Exception as e:
+        logging.error(f"Error sending email popup trigger: {e}")
+    
+    return "Opening email composer for you, Boss."
+
 @function_tool()    
 async def send_email(context: RunContext, to_email: str, subject: str, message: str, cc_email: Optional[str] = None) -> str:
     try:
         smtp_server = "smtp.gmail.com"
         smtp_port = 587
-        gmail_user = os.getenv("GMAIL_USER")
-        gmail_password = os.getenv("GMAIL_APP_PASSWORD")
-        if not gmail_user or not gmail_password:
-            logging.error("Gmail credentials not found in environment variables")
-            return "Email sending failed: Gmail credentials not configured."
+        # Use environment variables if set, otherwise use default credentials
+        gmail_user = os.getenv("GMAIL_USER") or "nevirachatbot@gmail.com"
+        gmail_password = os.getenv("GMAIL_APP_PASSWORD") or "nevira123"
+        
+        # Note: For production, it's recommended to use an app-specific password
+        # The password "nevira123" may not work if 2FA is enabled or if Google requires app passwords
         resolved_to = _resolve_email(to_email)
         if not resolved_to:
             return f"Email sending failed: Could not resolve a valid email for '{to_email}'."
@@ -147,7 +290,7 @@ async def send_email(context: RunContext, to_email: str, subject: str, message: 
         return f"Email sent successfully to {resolved_to}"
     except smtplib.SMTPAuthenticationError:
         logging.error("Gmail authentication failed")
-        return "Email sending failed: Authentication error. Please check your Gmail credentials."
+        return "I apologize, Boss. Email authentication failed. If 2FA is enabled on your Gmail account, you'll need to use an App Password instead of your regular password. You can create one at https://myaccount.google.com/apppasswords"
     except smtplib.SMTPException as e:
         logging.error(f"SMTP error occurred: {e}")
         return f"Email sending failed: SMTP error - {str(e)}"
@@ -408,3 +551,101 @@ async def restart_system(context: RunContext) -> str:
         return "System restart initiated. Please save your work."
     except Exception as e:
         return f"Error while trying to restart: {str(e)}"
+
+
+# ==================== AUTOMATION TOOLS ====================
+
+@function_tool()
+async def add_task(context: RunContext, task_description: str, priority: str = "medium", due_date: Optional[str] = None) -> str:
+    """Add a new task to your task list."""
+    return await asyncio.to_thread(add_task_func, task_description, priority, due_date)
+
+
+@function_tool()
+async def list_tasks(context: RunContext, show_completed: bool = False) -> str:
+    """List all your tasks."""
+    return await asyncio.to_thread(list_tasks_func, show_completed)
+
+
+@function_tool()
+async def complete_task(context: RunContext, task_id: Optional[int] = None, task_description: Optional[str] = None) -> str:
+    """Mark a task as completed. Provide either task_id (number) or task_description."""
+    return await asyncio.to_thread(complete_task_func, task_id, task_description)
+
+
+@function_tool()
+async def delete_task(context: RunContext, task_id: int) -> str:
+    """Delete a task by its ID number."""
+    return await asyncio.to_thread(delete_task_func, task_id)
+
+
+@function_tool()
+async def organize_downloads(context: RunContext) -> str:
+    """Organize files in Downloads folder by file type (Images, Documents, Videos, etc.)."""
+    return await asyncio.to_thread(organize_downloads_folder)
+
+
+@function_tool()
+async def find_duplicates(context: RunContext, directory: Optional[str] = None) -> str:
+    """Find duplicate files in a directory based on file content."""
+    return await asyncio.to_thread(find_duplicate_files, directory)
+
+
+@function_tool()
+async def clean_temp(context: RunContext) -> str:
+    """Clean temporary files and cache to free up disk space."""
+    return await asyncio.to_thread(clean_temp_files)
+
+
+@function_tool()
+async def get_clipboard(context: RunContext) -> str:
+    """Get the current content of the clipboard."""
+    return await asyncio.to_thread(get_clipboard_func)
+
+
+@function_tool()
+async def set_clipboard(context: RunContext, text: str) -> str:
+    """Copy text to the clipboard."""
+    return await asyncio.to_thread(set_clipboard_func, text)
+
+
+@function_tool()
+async def generate_password(context: RunContext, length: int = 16, include_symbols: bool = True) -> str:
+    """Generate a secure random password. Automatically copies to clipboard."""
+    return await asyncio.to_thread(generate_secure_password, length, include_symbols)
+
+
+@function_tool()
+async def word_count(context: RunContext, text: str) -> str:
+    """Count words, characters, lines, and sentences in text."""
+    return await asyncio.to_thread(word_count, text)
+
+
+@function_tool()
+async def check_internet(context: RunContext) -> str:
+    """Check internet connectivity and ping latency."""
+    return await asyncio.to_thread(check_internet_connection)
+
+
+@function_tool()
+async def get_network_stats(context: RunContext) -> str:
+    """Get network statistics (bytes sent/received, packets)."""
+    return await asyncio.to_thread(get_network_stats)
+
+
+@function_tool()
+async def list_processes(context: RunContext, top_n: int = 10) -> str:
+    """List top running processes by CPU usage."""
+    return await asyncio.to_thread(list_running_processes, top_n)
+
+
+@function_tool()
+async def kill_process(context: RunContext, process_name: str) -> str:
+    """Kill a running process by name."""
+    return await asyncio.to_thread(kill_process_by_name, process_name)
+
+
+@function_tool()
+async def get_disk_usage(context: RunContext, path: Optional[str] = None) -> str:
+    """Get disk usage statistics for a path (defaults to home directory)."""
+    return await asyncio.to_thread(get_disk_usage, path)

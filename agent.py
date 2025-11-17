@@ -1,10 +1,14 @@
 from dotenv import load_dotenv
+from datetime import datetime
 import os
+import json
+import asyncio
 import logging
 import sounddevice as sd
 
 from livekit import agents
 from livekit.agents import AgentSession, Agent, RoomInputOptions
+from livekit.agents.llm.chat_context import ChatMessage
 from livekit.plugins import noise_cancellation
 from livekit.plugins import google
 from prompts import AGENT_INSTRUCTION, SESSION_INSTRUCTION
@@ -12,6 +16,7 @@ from tools import (
     get_weather,
     search_web,
     send_email,
+    open_email_composer,
     control_volume,
     open_application,
     close_application,
@@ -24,7 +29,24 @@ from tools import (
     get_latest_news_tool,
     book_movie_ticket_tool,
     shutdown_system,
-    restart_system
+    restart_system,
+    # Automation tools
+    add_task,
+    list_tasks,
+    complete_task,
+    delete_task,
+    organize_downloads,
+    find_duplicates,
+    clean_temp,
+    get_clipboard,
+    set_clipboard,
+    generate_password,
+    word_count,
+    check_internet,
+    get_network_stats,
+    list_processes,
+    kill_process,
+    get_disk_usage
 )
 
 load_dotenv()
@@ -46,6 +68,7 @@ class Assistant(Agent):
                 get_weather,
                 search_web,
                 send_email,
+                open_email_composer,
                 # Desktop automation tools
                 control_volume,
                 open_application,
@@ -59,7 +82,28 @@ class Assistant(Agent):
                 get_latest_news_tool,
                 book_movie_ticket_tool,
                 shutdown_system,
-                restart_system
+                restart_system,
+                # Task Management
+                add_task,
+                list_tasks,
+                complete_task,
+                delete_task,
+                # File Organization
+                organize_downloads,
+                find_duplicates,
+                clean_temp,
+                # Clipboard Operations
+                get_clipboard,
+                set_clipboard,
+                # Utilities
+                generate_password,
+                word_count,
+                # Network & System
+                check_internet,
+                get_network_stats,
+                list_processes,
+                kill_process,
+                get_disk_usage
             ],
         )
 
@@ -128,6 +172,76 @@ async def entrypoint(ctx: agents.JobContext):
     await session.generate_reply(
         instructions=SESSION_INSTRUCTION,
     )
+
+    async def send_chat_message(message: str, images: list[dict] | None = None) -> None:
+        """Push assistant responses to the UI chat."""
+        if not message:
+            return
+        payload = {
+            "type": "assistant_message",
+            "message": message,
+            "text": message,
+            "images": images or [],
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        try:
+            await ctx.room.local_participant.publish_data(
+                json.dumps(payload).encode("utf-8"),
+                reliable=True,
+            )
+        except Exception as exc:
+            logger.warning("Failed to send chat update: %s", exc)
+
+    speech_buffers: dict[str, list[str]] = {}
+
+    def handle_speech_created(event) -> None:
+        handle = event.speech_handle
+        speech_buffers[handle.id] = []
+
+        def on_item_added(item):
+            if isinstance(item, ChatMessage) and item.role == "assistant":
+                text = (item.text_content or "").strip()
+                if text:
+                    speech_buffers[handle.id].append(text)
+
+        def on_done(_handle):
+            handle._remove_item_added_callback(on_item_added)
+            handle.remove_done_callback(on_done)
+            combined = "\n".join(speech_buffers.pop(handle.id, [])).strip()
+            if combined:
+                asyncio.create_task(send_chat_message(combined))
+
+        handle._add_item_added_callback(on_item_added)
+        handle.add_done_callback(on_done)
+
+    session.on("speech_created", handle_speech_created)
+
+    def handle_data_packet(packet) -> None:
+        try:
+            payload = json.loads(packet.data.decode("utf-8"))
+        except Exception:
+            logger.warning("Received malformed data packet")
+            return
+
+        if payload.get("type") != "user_command":
+            return
+
+        text = (payload.get("text") or payload.get("message") or "").strip()
+        if not text:
+            return
+
+        async def process_text_request():
+            try:
+                await session.generate_reply(instructions=text)
+            except Exception as exc:
+                logger.error("Failed to process chat command: %s", exc)
+                await send_chat_message(
+                    "I ran into an unexpected issue while responding. Please try again."
+                )
+
+        asyncio.create_task(process_text_request())
+
+    ctx.room.on("data_received", handle_data_packet)
 
     # Keep the session alive to handle ongoing user interactions.
     # Without this, the process may exit after the initial reply and stop responding.

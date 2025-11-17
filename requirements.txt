@@ -16,6 +16,7 @@ python-dotenv
 # Desktop Automation (from Nevira)
 pyautogui
 psutil
+pyperclip
 
 # Audio Devices
 sounddevice

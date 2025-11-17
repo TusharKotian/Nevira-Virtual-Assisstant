@@ -210,6 +210,16 @@ For web-based interaction with video:
 python agent.py dev
 ```
 
+### Run Everything at Once
+
+To start the token server, web UI, and Python agent with a single command:
+
+```bash
+python run_all.py
+```
+
+This launcher spawns all three processes and streams their logs in one terminal. Press `Ctrl+C` to stop every service together.
+
 This will:
 1. Start the agent worker
 2. Connect to your LiveKit cloud project
