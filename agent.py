@@ -169,10 +169,6 @@ async def entrypoint(ctx: agents.JobContext):
     logger.info("Agent session started successfully")
     logger.info(f"Room participants: {[p.identity for p in ctx.room.remote_participants.values()]}")
 
-    await session.generate_reply(
-        instructions=SESSION_INSTRUCTION,
-    )
-
     async def send_chat_message(message: str, images: list[dict] | None = None) -> None:
         """Push assistant responses to the UI chat."""
         if not message:
@@ -242,6 +238,15 @@ async def entrypoint(ctx: agents.JobContext):
         asyncio.create_task(process_text_request())
 
     ctx.room.on("data_received", handle_data_packet)
+
+    # After all handlers are registered and the room is ready, send an initial greeting
+    # so that whenever a user connects to the room, the assistant starts participating.
+    try:
+        await session.generate_reply(
+            instructions=SESSION_INSTRUCTION,
+        )
+    except Exception as exc:
+        logger.error("Failed to send initial greeting: %s", exc)
 
     # Keep the session alive to handle ongoing user interactions.
     # Without this, the process may exit after the initial reply and stop responding.
