@@ -5,7 +5,7 @@ import json
 import datetime
 import webbrowser
 import platform
-from typing import Optional
+from typing import Optional, Any, List, Dict, cast
 import asyncio
 import requests
 import pyautogui
@@ -15,6 +15,9 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from ddgs import DDGS
 from livekit.agents import function_tool, RunContext
+
+from dotenv import load_dotenv
+load_dotenv()
 
 from movie_ticket_agent import book_ticket
 from latest_news_agent import get_latest_news
@@ -29,18 +32,36 @@ from automation_agent import (
     get_clipboard as get_clipboard_func,
     set_clipboard as set_clipboard_func,
     generate_secure_password,
-    word_count,
+    word_count as word_count_func,
     check_internet_connection,
-    get_network_stats,
+    get_network_stats as get_network_stats_func,
     list_running_processes,
     kill_process_by_name,
-    get_disk_usage
+    get_disk_usage as get_disk_usage_func
+)
+from file_ops_agent import (
+    list_files,
+    rename_files,
+    move_files,
+    organize_folder,
+    analyze_file,
+    find_large_files,
+    find_duplicates as find_duplicates_fileops,
+    undo_last_operation
+)
+from email_contacts import (
+    init_db,
+    add_contact,
+    update_contact,
+    delete_contact,
+    get_contact_email,
+    list_contacts
 )
 
-async def _send_to_ui(context: RunContext, text: str, images: list = None):
+# Helper to send UI messages. images now Optional[List[dict]]
+async def _send_to_ui(context: RunContext, text: str, images: Optional[List[Dict]] = None) -> None:
     """Helper function to send messages to UI chat."""
     try:
-        import json
         payload = {
             "type": "assistant_message",
             "message": text,
@@ -48,13 +69,16 @@ async def _send_to_ui(context: RunContext, text: str, images: list = None):
             "images": images or [],
             "timestamp": datetime.datetime.now().isoformat()
         }
-        if context and context.room:
-            await context.room.local_participant.publish_data(
+        # Cast context to Any to access .room without Pylance complaining
+        room = cast(Any, context).room if context is not None else None
+        if room and getattr(room, "local_participant", None):
+            await room.local_participant.publish_data(
                 json.dumps(payload).encode('utf-8'),
                 reliable=True
             )
     except Exception as e:
         logging.warning(f"Could not send message to UI: {e}")
+
 
 @function_tool()
 async def get_latest_news_tool(context: RunContext, category: str = "business", count: int = 5) -> str:
@@ -65,7 +89,7 @@ async def get_latest_news_tool(context: RunContext, category: str = "business", 
             result = f"I couldn't find any news in the {category} category, Boss. Please try again or try a different category."
         else:
             result = news_text
-        # Send to UI
+        # Send to UI (ignore errors)
         await _send_to_ui(context, result)
         return result
     except Exception as e:
@@ -74,44 +98,49 @@ async def get_latest_news_tool(context: RunContext, category: str = "business", 
         await _send_to_ui(context, result)
         return result
 
+
 @function_tool()
 async def book_movie_ticket_tool(movie_name: str, location: str, date: str, num_tickets: int = 1) -> str:
     """Book movie tickets with improved error handling."""
     try:
         result = await asyncio.to_thread(book_ticket, "movie", location, date, num_tickets)
         # The book_ticket function already returns user-friendly messages
-        return result
+        return result or "Booking attempt finished but no message returned."
     except Exception as e:
         logging.error(f"Error in book_movie_ticket_tool: {e}")
         return f"I apologize, Boss. An unexpected error occurred while booking movie tickets: {str(e)}. Please try again or visit BookMyShow directly."
+
 
 @function_tool()
 async def get_weather(context: RunContext, city: str) -> str:
     """Get weather information for a city with improved error handling."""
     import urllib.parse
-    
+
     # Clean and encode city name
-    city_clean = city.strip()
+    city_clean = (city or "").strip()
+    if not city_clean:
+        return "Please provide a city name, Boss."
+
     city_encoded = urllib.parse.quote(city_clean)
-    
+
     # Try multiple formats for better results
     formats = [
         f"https://wttr.in/{city_encoded}?format=3",
         f"https://wttr.in/{city_encoded}?format=1",
     ]
-    
+
     for url in formats:
         try:
             response = requests.get(url, timeout=10, headers={
                 'User-Agent': 'Mozilla/5.0 (compatible; Nevira Assistant)'
             })
-            
+
             if response.status_code == 200:
                 weather_text = response.text.strip()
                 if weather_text and weather_text != "Unknown location":
                     logging.info(f"Weather for {city_clean}: {weather_text}")
                     return f"Weather in {city_clean}: {weather_text}"
-            
+
         except requests.exceptions.Timeout:
             logging.warning(f"Weather API timeout for {city_clean}")
             continue
@@ -121,54 +150,60 @@ async def get_weather(context: RunContext, city: str) -> str:
         except Exception as e:
             logging.error(f"Unexpected error getting weather for {city_clean}: {e}")
             continue
-    
+
     # Fallback message
     return f"I apologize, Boss. I couldn't retrieve the weather for {city_clean} at this moment. Please try again in a moment, or check the city name is correct."
+
 
 @function_tool()
 async def search_web(context: RunContext, query: str) -> str:
     """Search the web with improved error handling and retries."""
     if not query or not query.strip():
         return "Boss, I need a search query to help you. What would you like me to search for?"
-    
+
     query_clean = query.strip()
     max_retries = 2
-    
+
     for attempt in range(max_retries):
         try:
-            with DDGS(timeout=10) as ddgs:
+            # Cast DDGS to Any before using it in a with-statement so Pylance doesn't complain
+            ddgs_obj = cast(Any, DDGS())
+            with ddgs_obj as ddgs:
                 results = list(ddgs.text(query_clean, max_results=5))
-                
+
                 if not results:
                     # Try with a simpler query on retry
                     if attempt < max_retries - 1:
                         continue
                     return f"I couldn't find any results for '{query_clean}', Boss. Perhaps try rephrasing your search or checking the spelling."
-                
+
                 formatted_results = []
                 for i, result in enumerate(results, 1):
                     title = result.get('title', 'No title') or 'No title'
                     body = result.get('body', 'No description') or 'No description available'
                     url = result.get('href', '') or result.get('url', '')
-                    
+
                     # Truncate long descriptions
                     if len(body) > 200:
                         body = body[:200] + "..."
-                    
+
                     formatted_results.append(
                         f"{i}. {title}\n   {body}\n   {url if url else 'URL not available'}"
                     )
-                
+
                 output = f"I found {len(results)} result(s) for '{query_clean}':\n\n" + "\n\n".join(formatted_results)
                 logging.info(f"Search results for '{query_clean}': Found {len(results)} results")
                 return output
-                
+
         except Exception as e:
             logging.error(f"Error searching the web for '{query_clean}' (attempt {attempt + 1}): {e}")
             if attempt < max_retries - 1:
                 await asyncio.sleep(1)  # Wait before retry
                 continue
             return f"I apologize, Boss. I encountered an issue searching for '{query_clean}'. Please try again in a moment."
+    # Fallback (should not reach)
+    return f"I apologize, Boss. I couldn't complete your search for '{query_clean}'."
+
 
 def _looks_like_email(value: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", value or ""))
@@ -185,7 +220,7 @@ def _load_contacts() -> dict:
         "kevin": "22j25.kevin@sjec.ac.in",
         "aden": "22j01.aden@sjec.ac.in"
     }
-    
+
     # Load from environment variable if available (will override defaults)
     try:
         contacts_env = os.getenv("CONTACTS_JSON", "")
@@ -196,7 +231,7 @@ def _load_contacts() -> dict:
             return default_contacts
     except Exception:
         pass
-    
+
     return default_contacts
 
 
@@ -211,7 +246,8 @@ def _resolve_email(recipient: str) -> Optional[str]:
     if key in contacts and _looks_like_email(contacts[key]):
         return contacts[key]
     try:
-        with DDGS() as ddgs:
+        ddgs_obj = cast(Any, DDGS())
+        with ddgs_obj as ddgs:
             query = f"{recipient} email address"
             results = list(ddgs.text(query, max_results=5))
             for r in results:
@@ -237,26 +273,27 @@ async def open_email_composer(context: RunContext) -> str:
     """
     try:
         # Send data message to trigger popup in UI
-        import json
         data = {
             "type": "email_popup_trigger",
             "message": "Opening email composer for you, Boss.",
             "timestamp": datetime.datetime.now().isoformat()
         }
-        
-        # Send data message to trigger popup
-        await context.room.local_participant.publish_data(
-            json.dumps(data).encode('utf-8'), 
-            reliable=True
-        )
-        
+
+        room = cast(Any, context).room if context is not None else None
+        if room and getattr(room, "local_participant", None):
+            await room.local_participant.publish_data(
+                json.dumps(data).encode('utf-8'),
+                reliable=True
+            )
+
         logging.info("Sent email popup trigger data message")
     except Exception as e:
         logging.error(f"Error sending email popup trigger: {e}")
-    
+
     return "Opening email composer for you, Boss."
 
-@function_tool()    
+
+@function_tool()
 async def send_email(context: RunContext, to_email: str, subject: str, message: str, cc_email: Optional[str] = None) -> str:
     try:
         smtp_server = "smtp.gmail.com"
@@ -264,9 +301,7 @@ async def send_email(context: RunContext, to_email: str, subject: str, message: 
         # Use environment variables if set, otherwise use default credentials
         gmail_user = os.getenv("GMAIL_USER") or "nevirachatbot@gmail.com"
         gmail_password = os.getenv("GMAIL_APP_PASSWORD") or "nevira123"
-        
-        # Note: For production, it's recommended to use an app-specific password
-        # The password "nevira123" may not work if 2FA is enabled or if Google requires app passwords
+
         resolved_to = _resolve_email(to_email)
         if not resolved_to:
             return f"Email sending failed: Could not resolve a valid email for '{to_email}'."
@@ -298,6 +333,7 @@ async def send_email(context: RunContext, to_email: str, subject: str, message: 
         logging.error(f"Error sending email: {e}")
         return f"An error occurred while sending email: {str(e)}"
 
+
 @function_tool()
 async def control_volume(context: RunContext, action: str) -> str:
     try:
@@ -323,6 +359,7 @@ async def control_volume(context: RunContext, action: str) -> str:
     except Exception as e:
         logging.error(f"Error controlling volume: {e}")
         return f"Could not control volume: {str(e)}"
+
 
 @function_tool()
 async def open_application(context: RunContext, app_name: str) -> str:
@@ -353,6 +390,7 @@ async def open_application(context: RunContext, app_name: str) -> str:
         logging.error(f"Error opening application '{app_name}': {e}")
         return f"Could not open {app_name}: {str(e)}"
 
+
 @function_tool()
 async def close_application(context: RunContext, app_name: str) -> str:
     try:
@@ -375,6 +413,7 @@ async def close_application(context: RunContext, app_name: str) -> str:
     except Exception as e:
         logging.error(f"Error closing application '{app_name}': {e}")
         return f"Could not close {app_name}: {str(e)}"
+
 
 @function_tool()
 async def open_website(context: RunContext, site_name: str) -> str:
@@ -399,7 +438,8 @@ async def open_website(context: RunContext, site_name: str) -> str:
         if site_lower.startswith('youtube '):
             query = site_name.split(' ', 1)[1]
             try:
-                with DDGS() as ddgs:
+                ddgs_obj = cast(Any, DDGS())
+                with ddgs_obj as ddgs:
                     video_results = list(ddgs.videos(keywords=query, max_results=1))
                 if video_results:
                     url = video_results[0].get('content') or video_results[0].get('url') or video_results[0].get('href')
@@ -426,6 +466,7 @@ async def open_website(context: RunContext, site_name: str) -> str:
         logging.error(f"Error opening website '{site_name}': {e}")
         return f"Could not open website: {str(e)}"
 
+
 @function_tool()
 async def search_google(context: RunContext, query: str) -> str:
     try:
@@ -436,6 +477,7 @@ async def search_google(context: RunContext, query: str) -> str:
     except Exception as e:
         logging.error(f"Error searching Google: {e}")
         return f"Could not perform Google search: {str(e)}"
+
 
 @function_tool()
 async def get_system_status(context: RunContext) -> str:
@@ -457,6 +499,7 @@ async def get_system_status(context: RunContext) -> str:
     except Exception as e:
         logging.error(f"Error getting system status: {e}")
         return f"Could not retrieve system status: {str(e)}"
+
 
 @function_tool()
 async def get_schedule(context: RunContext, day: Optional[str] = None) -> str:
@@ -485,6 +528,7 @@ async def get_schedule(context: RunContext, day: Optional[str] = None) -> str:
         logging.error(f"Error getting schedule: {e}")
         return f"Could not retrieve schedule: {str(e)}"
 
+
 @function_tool()
 async def get_time_and_date(context: RunContext) -> str:
     try:
@@ -498,6 +542,7 @@ async def get_time_and_date(context: RunContext) -> str:
     except Exception as e:
         logging.error(f"Error getting time and date: {e}")
         return f"Boss, I could not retrieve the time and date due to an error: {str(e)}"
+
 
 @function_tool()
 async def take_screenshot(context: RunContext, filename: Optional[str] = None) -> str:
@@ -515,6 +560,8 @@ async def take_screenshot(context: RunContext, filename: Optional[str] = None) -
     except Exception as e:
         logging.error(f"Error taking screenshot: {e}")
         return f"Could not take screenshot: {str(e)}"
+
+
 @function_tool(name="shutdown_system", description="Shuts down the user's computer safely.")
 async def shutdown_system(context: RunContext) -> str:
     """
@@ -528,7 +575,7 @@ async def shutdown_system(context: RunContext) -> str:
             await asyncio.create_subprocess_shell("sudo shutdown -h now")
         else:
             return "Unsupported operating system for shutdown command."
-        
+
         return "System shutdown initiated. Please save your work."
     except Exception as e:
         return f"Error while trying to shut down: {str(e)}"
@@ -547,7 +594,7 @@ async def restart_system(context: RunContext) -> str:
             await asyncio.create_subprocess_shell("sudo shutdown -r now")
         else:
             return "Unsupported operating system for restart command."
-        
+
         return "System restart initiated. Please save your work."
     except Exception as e:
         return f"Error while trying to restart: {str(e)}"
@@ -588,7 +635,8 @@ async def organize_downloads(context: RunContext) -> str:
 @function_tool()
 async def find_duplicates(context: RunContext, directory: Optional[str] = None) -> str:
     """Find duplicate files in a directory based on file content."""
-    return await asyncio.to_thread(find_duplicate_files, directory)
+    dir_arg = directory or os.path.expanduser("~")
+    return await asyncio.to_thread(find_duplicate_files, dir_arg)
 
 
 @function_tool()
@@ -618,7 +666,7 @@ async def generate_password(context: RunContext, length: int = 16, include_symbo
 @function_tool()
 async def word_count(context: RunContext, text: str) -> str:
     """Count words, characters, lines, and sentences in text."""
-    return await asyncio.to_thread(word_count, text)
+    return await asyncio.to_thread(word_count_func, text)
 
 
 @function_tool()
@@ -630,7 +678,7 @@ async def check_internet(context: RunContext) -> str:
 @function_tool()
 async def get_network_stats(context: RunContext) -> str:
     """Get network statistics (bytes sent/received, packets)."""
-    return await asyncio.to_thread(get_network_stats)
+    return await asyncio.to_thread(get_network_stats_func)
 
 
 @function_tool()
@@ -648,4 +696,100 @@ async def kill_process(context: RunContext, process_name: str) -> str:
 @function_tool()
 async def get_disk_usage(context: RunContext, path: Optional[str] = None) -> str:
     """Get disk usage statistics for a path (defaults to home directory)."""
-    return await asyncio.to_thread(get_disk_usage, path)
+    path_arg = path or os.path.expanduser("~")
+    return await asyncio.to_thread(get_disk_usage_func, path_arg)
+
+
+# ==================== FILE OPERATIONS TOOLS ====================
+
+@function_tool()
+async def list_files_tool(context: RunContext, directory: str, extension: Optional[str] = None,
+                          name_contains: Optional[str] = None, size_min_mb: Optional[float] = None,
+                          size_max_mb: Optional[float] = None, modified_days: Optional[int] = None,
+                          limit: int = 50) -> str:
+    """List files in a directory with optional filters."""
+    dir_arg = directory or os.path.expanduser("~")
+    return await asyncio.to_thread(list_files, dir_arg, extension, name_contains, size_min_mb, size_max_mb, modified_days, limit)
+
+
+@function_tool()
+async def rename_files_tool(context: RunContext, directory: str, prefix: Optional[str] = None,
+                            suffix: Optional[str] = None, replace_old: Optional[str] = None,
+                            replace_new: Optional[str] = None, add_sequence: bool = False,
+                            confirm: bool = False) -> str:
+    """Rename files in a directory with specified rules."""
+    dir_arg = directory or os.path.expanduser("~")
+    return await asyncio.to_thread(rename_files, dir_arg, prefix, suffix, replace_old, replace_new, add_sequence, confirm)
+
+
+@function_tool()
+async def move_files_tool(context: RunContext, source_dir: str, dest_dir: str, extension: Optional[str] = None,
+                          name_contains: Optional[str] = None, confirm: bool = False) -> str:
+    """Move files from source to destination directory based on filters."""
+    src = source_dir or os.path.expanduser("~")
+    dst = dest_dir or os.path.expanduser("~")
+    return await asyncio.to_thread(move_files, src, dst, extension, name_contains, confirm)
+
+
+@function_tool()
+async def organize_folder_tool(context: RunContext, directory: str, confirm: bool = False) -> str:
+    """Organize files in a folder by file type (Images, Documents, Videos, etc.)."""
+    dir_arg = directory or os.path.expanduser("~")
+    return await asyncio.to_thread(organize_folder, dir_arg, confirm)
+
+
+@function_tool()
+async def analyze_file_tool(context: RunContext, filepath: str) -> str:
+    """Analyze the content of a text file."""
+    fp = filepath or ""
+    return await asyncio.to_thread(analyze_file, fp)
+
+
+@function_tool()
+async def find_large_files_tool(context: RunContext, directory: str, size_threshold_mb: float = 100) -> str:
+    """Find files larger than a specified size threshold."""
+    dir_arg = directory or os.path.expanduser("~")
+    return await asyncio.to_thread(find_large_files, dir_arg, size_threshold_mb)
+
+
+@function_tool()
+async def find_duplicates_tool(context: RunContext, directory: str) -> str:
+    """Find duplicate files in a directory based on content hash."""
+    dir_arg = directory or os.path.expanduser("~")
+    return await asyncio.to_thread(find_duplicates_fileops, dir_arg)
+
+
+@function_tool()
+async def undo_last_operation_tool(context: RunContext) -> str:
+    """Undo the last file operation (limited support)."""
+    return await asyncio.to_thread(undo_last_operation)
+
+
+# ==================== EMAIL CONTACT MANAGEMENT TOOLS ====================
+
+@function_tool()
+async def add_contact_tool(context: RunContext, name: str, email: str) -> str:
+    """Add a new contact with name and email address."""
+    return await asyncio.to_thread(add_contact, name, email)
+
+@function_tool()
+async def update_contact_tool(context: RunContext, name: str, email: str) -> str:
+    """Update an existing contact's email address."""
+    return await asyncio.to_thread(update_contact, name, email)
+
+@function_tool()
+async def delete_contact_tool(context: RunContext, name: str) -> str:
+    """Delete a contact by name."""
+    return await asyncio.to_thread(delete_contact, name)
+
+@function_tool()
+async def list_contacts_tool(context: RunContext) -> str:
+    """List all saved contacts."""
+    contacts = await asyncio.to_thread(list_contacts)
+    if not contacts:
+        return "No contacts saved yet."
+
+    result = "Saved contacts:\n"
+    for name, email in contacts:
+        result += f"- {name}: {email}\n"
+    return result.strip()

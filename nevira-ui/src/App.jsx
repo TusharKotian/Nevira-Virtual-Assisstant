@@ -1,9 +1,15 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Room, RoomEvent, Track } from 'livekit-client';
 import './App.css';
+import ContactManager from './ContactManager';
 
-const TOKEN_SERVER = 'http://localhost:3001/token';
-const LIVEKIT_URL = 'wss://deskto-ai-zog435cw.livekit.cloud';
+// Load Vite env vars (available as import.meta.env)
+console.log("[Nevira UI] import.meta.env:", import.meta.env);
+console.log("[Nevira UI] VITE_LK_SERVER_URL:", import.meta.env.VITE_LK_SERVER_URL);
+console.log("[Nevira UI] VITE_TOKEN_ENDPOINT:", import.meta.env.VITE_TOKEN_ENDPOINT);
+
+const TOKEN_SERVER = import.meta.env.VITE_TOKEN_ENDPOINT || 'http://localhost:3001/token';
+const LIVEKIT_URL = import.meta.env.VITE_LK_SERVER_URL || 'wss://deskto-ai-zog435cw.livekit.cloud';
 const ROOM_NAME = 'nevira-room';
 
 function App() {
@@ -27,6 +33,7 @@ function App() {
   const [micLevel, setMicLevel] = useState(0);
   const [showEmailPopup, setShowEmailPopup] = useState(false);
   const [showEmailSentPopup, setShowEmailSentPopup] = useState(false);
+  const [showContactManager, setShowContactManager] = useState(false);
   const [emailForm, setEmailForm] = useState({
     to: '',
     subject: '',
@@ -58,20 +65,32 @@ function App() {
   // Get access token from server
   const getToken = async (identity) => {
     try {
+      console.log('[DEBUG] Requesting token from', TOKEN_SERVER, 'identity=', identity);
+      console.log('[DEBUG] import.meta.env values:', {
+        VITE_LK_SERVER_URL: import.meta.env.VITE_LK_SERVER_URL,
+        VITE_TOKEN_ENDPOINT: import.meta.env.VITE_TOKEN_ENDPOINT
+      });
       const response = await fetch(TOKEN_SERVER, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ identity, roomName: ROOM_NAME }),
       });
-      
+
+      console.log('[DEBUG] Token response status', response.status, response.statusText, 'headers:', Object.fromEntries(response.headers.entries()));
       if (!response.ok) {
-        throw new Error(`Token request failed: ${response.statusText}`);
+        const text = await response.text().catch(() => '<no-body>');
+        throw new Error(`Token request failed: ${response.status} ${response.statusText} ${text}`);
       }
-      
+
       const data = await response.json();
+      console.log('[DEBUG] Token response JSON', data);
+      if (!data || !data.token) {
+        throw new Error('Token response missing `token` field');
+      }
+      console.log('[DEBUG] Token fetch successful');
       return data.token;
     } catch (err) {
-      console.error('Error getting token:', err);
+      console.error('[DEBUG] Error getting token:', err);
       throw err;
     }
   };
@@ -89,6 +108,7 @@ function App() {
       const token = await getToken(identity);
       
       // Create room instance
+      console.debug('Connecting to LiveKit URL:', LIVEKIT_URL);
       const newRoom = new Room({
         adaptiveStream: true,
         dynacast: true,
@@ -100,7 +120,19 @@ function App() {
       setupRoomListeners(newRoom);
 
       // Connect to room
-      await newRoom.connect(LIVEKIT_URL, token);
+      try {
+        await newRoom.connect(LIVEKIT_URL, token);
+        console.log('[DEBUG] Connected to LiveKit room successfully');
+        console.log('[DEBUG] Connected room info:', {
+          name: newRoom.name,
+          sid: newRoom.sid,
+          localParticipant: newRoom.localParticipant?.identity,
+          remoteParticipants: Object.keys(newRoom.remoteParticipants || {})
+        });
+      } catch (connErr) {
+        console.error('[DEBUG] LiveKit connect failed:', connErr);
+        throw connErr;
+      }
       
       // Enable microphone
       await newRoom.localParticipant.setMicrophoneEnabled(true, {
@@ -126,6 +158,61 @@ function App() {
       setRoom(newRoom);
       setConnected(true);
       console.log('✅ Connected to room:', ROOM_NAME);
+
+      // Expose room for debugging
+      window.room = newRoom;
+      console.log("[Nevira UI] exposed room on window.room, sid=", newRoom?.sid);
+
+      // Register debug listeners
+      newRoom.on("participantConnected", p => console.log("[Nevira UI] participantConnected:", p.identity || p.sid));
+      newRoom.on("participantDisconnected", p => console.log("[Nevira UI] participantDisconnected:", p.identity || p.sid));
+      newRoom.on("trackPublished", (pub, participant) => console.log("[Nevira UI] trackPublished:", pub?.kind, "from", participant?.identity));
+      newRoom.on("trackSubscribed", (track, publication, participant) => console.log("[Nevira UI] trackSubscribed:", publication?.kind, "from", participant?.identity));
+      newRoom.on("dataReceived", packet => { try { console.log("[Nevira UI] dataReceived:", JSON.parse(new TextDecoder().decode(packet.data))); } catch(e){ console.log("[Nevira UI] dataReceived non-json", packet); }});
+
+      // Attach remote audio only (prevent loopback)
+      function attachRemoteAudio(publication, participant) {
+        try {
+          const local = newRoom.localParticipant;
+          const publisherIdentity = participant?.identity || participant?.sid || publication?.publisher?.identity;
+          if (publisherIdentity && (publisherIdentity === local.identity || publisherIdentity === local.sid)) {
+            console.log("[Nevira UI] Skipping local track (prevent loopback):", publisherIdentity);
+            return;
+          }
+          const kind = publication.kind || publication.track?.kind;
+          if (kind !== "audio") { return; }
+          const track = publication.track || publication;
+          if (!track) { console.log("[Nevira UI] publication has no track yet:", publication); return; }
+          const audioEl = document.createElement("audio");
+          audioEl.autoplay = true;
+          audioEl.playsInline = true;
+          audioEl.controls = false;
+          if (typeof track.attach === "function") track.attach(audioEl); else if (track.mediaStreamTrack) audioEl.srcObject = new MediaStream([track.mediaStreamTrack]);
+          document.body.appendChild(audioEl);
+          console.log("[Nevira UI] attached remote audio for:", publisherIdentity);
+        } catch(err) {
+          console.warn("[Nevira UI] attachRemoteAudio error:", err, publication);
+        }
+      }
+
+      // Attach existing remote pubs
+      for (const p of Object.values(newRoom.remoteParticipants || {})) {
+        const pubs = p.tracks || p.trackPublications || p.publications || {};
+        for (const k in pubs) attachRemoteAudio(pubs[k], p);
+      }
+
+      // Listen for future publications/subscriptions
+      newRoom.on("trackPublished", (publication, participant) => { console.log("[Nevira UI] trackPublished event"); attachRemoteAudio(publication, participant); });
+      newRoom.on("trackSubscribed", (track, publication, participant) => { console.log("[Nevira UI] trackSubscribed event"); attachRemoteAudio(publication, participant); });
+
+      // Publish initial user_command
+      (async () => {
+        try {
+          const initial = { type: "user_command", text: "Hello Nevira, please greet the user." };
+          newRoom.localParticipant.publishData(new TextEncoder().encode(JSON.stringify(initial)), { reliable: true });
+          console.log("[Nevira UI] initial user_command published:", initial.text);
+        } catch(e) { console.error("[Nevira UI] failed to publish initial user_command:", e); }
+      })();
       
     } catch (err) {
       console.error('Connection error:', err);
@@ -182,29 +269,6 @@ function App() {
 
   // Set up room event listeners
   const setupRoomListeners = (room) => {
-    // Track subscribed (remote audio from agent)
-    room.on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
-      console.log('Track subscribed:', track.kind, 'from', participant.identity);
-      setLogs((l) => [{ ts: Date.now(), msg: `Subscribed ${track.kind} from ${participant.identity}` }, ...l].slice(0, 50));
-      
-      if (track.kind === Track.Kind.Audio) {
-        const audioElement = track.attach();
-        audioElement.autoplay = true;
-        audioElement.playsInline = true;
-        audioElement.muted = false;
-        audioElement.volume = 1.0;
-        if (remoteAudioRef.current) {
-          remoteAudioRef.current.innerHTML = '';
-          remoteAudioRef.current.appendChild(audioElement);
-        }
-        
-        // Detect agent speaking
-        if (participant.identity.includes('agent') || participant.identity.includes('nevira')) {
-          setAgentSpeaking(true);
-          setTimeout(() => setAgentSpeaking(false), 3000);
-        }
-      }
-    });
 
     // When local track is published, re-wire analyser (fix mic meter not moving)
     room.on(RoomEvent.LocalTrackPublished, (_pub, participant) => {
@@ -217,14 +281,16 @@ function App() {
 
     // Participant connected
     room.on(RoomEvent.ParticipantConnected, (participant) => {
-      console.log('Participant connected:', participant.identity);
+      console.log('[DEBUG] Participant connected:', participant.identity);
+      console.log('[DEBUG] Participants list changed - current:', Array.from(room.remoteParticipants.values()).map(p => p.identity));
       setLogs((l) => [{ ts: Date.now(), msg: `+ ${participant.identity}` }, ...l].slice(0, 50));
       updateParticipants(room);
     });
 
     // Participant disconnected
     room.on(RoomEvent.ParticipantDisconnected, (participant) => {
-      console.log('Participant disconnected:', participant.identity);
+      console.log('[DEBUG] Participant disconnected:', participant.identity);
+      console.log('[DEBUG] Participants list changed - current:', Array.from(room.remoteParticipants.values()).map(p => p.identity));
       setLogs((l) => [{ ts: Date.now(), msg: `- ${participant.identity}` }, ...l].slice(0, 50));
       updateParticipants(room);
     });
@@ -254,21 +320,27 @@ function App() {
     room.on(RoomEvent.DataReceived, (payload, participant) => {
       try {
         const data = JSON.parse(new TextDecoder().decode(payload));
-        console.log('Data received:', data);
-        
+        console.log('[DEBUG] DataReceived packet:', data, 'from participant:', participant?.identity);
+
         if (data.type === 'email_popup_trigger') {
           console.log('Triggering email popup from voice command');
           setShowEmailPopup(true);
           setLogs((l) => [{ ts: Date.now(), msg: 'Email popup opened via voice command' }, ...l].slice(0, 50));
         } else if (data.type === 'assistant_message') {
-          // Add assistant message to chat
+          // Add assistant message to React state (no direct DOM manipulation)
           setMessages((prev) => [...prev, {
             id: Date.now(),
             sender: 'assistant',
-            text: data.message || data.text,
+            text: data.message || data.text || '',
             images: data.images || [],
             timestamp: Date.now()
           }]);
+
+          // Remove any previously injected stray element (cleanup)
+          const stray = document.getElementById('nevira-assistant-messages');
+          if (stray) {
+            try { stray.remove(); } catch(e) { /* ignore */ }
+          }
         }
       } catch (e) {
         // Try to add as text message if not JSON
@@ -374,6 +446,16 @@ function App() {
     }
     
     try {
+      // Add a user message reflecting the tool prompt
+      const userMessage = {
+        id: Date.now(),
+        sender: 'user',
+        text: t.prompt,
+        images: [],
+        timestamp: Date.now()
+      };
+      setMessages((prev) => [...prev, userMessage]);
+
       const payload = { type: 'user_command', text: t.prompt, ts: Date.now() };
       const data = new TextEncoder().encode(JSON.stringify(payload));
       await room.localParticipant.publishData(data, true);
@@ -398,6 +480,17 @@ function App() {
     setEmailSending(true);
     try {
       const emailCommand = `Send an email to ${emailForm.to} with subject "${emailForm.subject}" and message "${emailForm.body}"`;
+
+      // Show the composed email as a user message in the chat
+      const userMessage = {
+        id: Date.now(),
+        sender: 'user',
+        text: emailCommand,
+        images: [],
+        timestamp: Date.now()
+      };
+      setMessages((prev) => [...prev, userMessage]);
+
       const payload = { type: 'user_command', text: emailCommand, ts: Date.now() };
       const data = new TextEncoder().encode(JSON.stringify(payload));
       await room.localParticipant.publishData(data, true);
@@ -422,6 +515,11 @@ function App() {
   const handleEmailClose = () => {
     setShowEmailPopup(false);
     setEmailForm({ to: '', subject: '', body: '' });
+  };
+
+  const handleContactSelect = (contact) => {
+    setEmailForm((f) => ({ ...f, to: contact?.email || '' }));
+    setShowContactManager(false);
   };
 
   // Handle email sent popup close
@@ -494,15 +592,36 @@ function App() {
             <h2>Nevira</h2>
           </div>
           <nav className="nav">
-            <button className={`nav-btn ${activeTab==='Chat'?'active':''}`} onClick={() => setActiveTab('Chat')}>Chat</button>
-            <button className={`nav-btn ${activeTab==='Dashboard'?'active':''}`} onClick={() => setActiveTab('Dashboard')}>Dashboard</button>
-            <button className={`nav-btn ${activeTab==='Voice'?'active':''}`} onClick={() => setActiveTab('Voice')}>Voice</button>
-            <button className={`nav-btn ${activeTab==='Tools'?'active':''}`} onClick={() => setActiveTab('Tools')}>Tools</button>
-            <button className={`nav-btn ${activeTab==='Settings'?'active':''}`} onClick={() => setActiveTab('Settings')}>Settings</button>
+            <button className={`nav-btn ${activeTab==='Chat'?'active':''}`} onClick={() => setActiveTab('Chat')}>
+              <span className="nav-icon">💬</span>
+              Chat
+            </button>
+            <button className={`nav-btn ${activeTab==='Dashboard'?'active':''}`} onClick={() => setActiveTab('Dashboard')}>
+              <span className="nav-icon">📊</span>
+              Dashboard
+            </button>
+            <button className={`nav-btn ${activeTab==='Voice'?'active':''}`} onClick={() => setActiveTab('Voice')}>
+              <span className="nav-icon">🎤</span>
+              Voice
+            </button>
+            <button className={`nav-btn ${activeTab==='Tools'?'active':''}`} onClick={() => setActiveTab('Tools')}>
+              <span className="nav-icon">🛠️</span>
+              Tools
+            </button>
+            <button className={`nav-btn ${activeTab==='Contacts'?'active':''}`} onClick={() => setActiveTab('Contacts')}>
+              <span className="nav-icon">📇</span>
+              Contacts
+            </button>
+            <button className={`nav-btn ${activeTab==='Settings'?'active':''}`} onClick={() => setActiveTab('Settings')}>
+              <span className="nav-icon">⚙️</span>
+              Settings
+            </button>
           </nav>
           <div className="sidebar-footer">
-            <div className="status-dot"></div>
-            <span>{connected ? 'Online' : 'Offline'}</span>
+            <div className={`status-indicator ${connected ? 'online' : 'offline'}`}>
+              <div className={`status-dot ${connected ? 'online' : 'offline'}`}></div>
+              <span>{connected ? 'Online' : 'Offline'}</span>
+            </div>
           </div>
         </aside>
 
@@ -692,6 +811,16 @@ function App() {
                           </div>
                         </div>
                       ))}
+                      {connected && (
+                        <div className="typing-indicator">
+                          <div className="typing-dots">
+                            <span></span>
+                            <span></span>
+                            <span></span>
+                          </div>
+                          <span className="typing-text">Nevira is typing...</span>
+                        </div>
+                      )}
                       <div ref={messagesEndRef} />
                     </div>
                     <div className="chat-input-container">
@@ -845,13 +974,17 @@ function App() {
             <div className="email-popup-body">
               <div className="form-group">
                 <label htmlFor="email-to">To:</label>
-                <input
-                  id="email-to"
-                  type="email"
-                  placeholder="recipient@example.com"
-                  value={emailForm.to}
-                  onChange={(e) => setEmailForm({...emailForm, to: e.target.value})}
-                />
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                  <input
+                    id="email-to"
+                    type="email"
+                    placeholder="recipient@example.com"
+                    value={emailForm.to}
+                    onChange={(e) => setEmailForm({...emailForm, to: e.target.value})}
+                    style={{ flex: 1 }}
+                  />
+                  <button className="btn btn-secondary" onClick={() => setShowContactManager(true)} title="Choose from contacts">📇</button>
+                </div>
               </div>
               <div className="form-group">
                 <label htmlFor="email-subject">Subject:</label>
@@ -911,6 +1044,11 @@ function App() {
             </div>
           </div>
         </div>
+      )}
+
+      {/* Contact Manager Modal */}
+      {showContactManager && (
+        <ContactManager onClose={() => setShowContactManager(false)} onSelect={handleContactSelect} />
       )}
     </div>
   );
